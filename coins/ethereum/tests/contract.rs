@@ -1,9 +1,16 @@
-use ethereum_serai::contract::{
-  call_router_execute, call_router_execute_no_abi_encode, call_verify, deploy_router_contract,
-  deploy_schnorr_verifier_contract, router_mod,
+use ethereum_serai::{
+  crypto,
+  schnorr_contract::{call_verify, deploy_schnorr_verifier_contract},
+  router_contract::{call_router_execute, deploy_router_contract, router_mod},
 };
-use ethers::{prelude::*, utils::Anvil, abi};
-use std::{convert::TryFrom, sync::Arc, time::Duration};
+use frost::{curve::Secp256k1, FrostKeys};
+use k256::ProjectivePoint;
+use ethers::{
+  prelude::*,
+  utils::{Anvil, keccak256},
+  abi,
+};
+use std::{convert::TryFrom, collections::HashMap, sync::Arc, time::Duration};
 
 #[tokio::test]
 async fn test_deploy_schnorr_contract() {
@@ -27,37 +34,29 @@ async fn test_deploy_router_contract() {
   let _contract = deploy_router_contract(client).await.unwrap();
 }
 
-#[tokio::test]
-async fn test_call_router_execute() {
-  use ethereum_serai::crypto;
-  use ethers::utils::keccak256;
-  use frost::{
-    algorithm::Schnorr,
-    curve::Secp256k1,
-    tests::{algorithm_machines, key_gen, sign},
-  };
-  use k256::elliptic_curve::bigint::ArrayEncoding;
-  use k256::{Scalar, U256};
+async fn generate_keys() -> (HashMap<u16, FrostKeys<Secp256k1>>, ProjectivePoint) {
+  use frost::{tests::key_gen};
   use rand_core::OsRng;
-
-  let anvil = Anvil::new().spawn();
-  let wallet: LocalWallet = anvil.keys()[0].clone().into();
-  let provider =
-    Provider::<Http>::try_from(anvil.endpoint()).unwrap().interval(Duration::from_millis(10u64));
-  let chain_id = provider.get_chainid().await.unwrap();
-  let client = Arc::new(SignerMiddleware::new(provider, wallet));
 
   let keys = key_gen::<_, Secp256k1>(&mut OsRng);
   let group_key = keys[&1].group_key();
+  (keys, group_key)
+}
 
-  let to = H160([0u8; 20]);
-  let value = U256([0u64; 4]);
-  let data = Bytes::from([0]);
-  let tx = router_mod::Transaction { to: to.clone(), value: value.clone(), data: data.clone() };
-  let txs = vec![tx];
+async fn hash_and_sign(
+  message: &[u8],
+  keys: &HashMap<u16, FrostKeys<Secp256k1>>,
+  group_key: &ProjectivePoint,
+  chain_id: ethers::prelude::U256,
+) -> crypto::ProcessedSignature {
+  use frost::{
+    algorithm::Schnorr,
+    tests::{algorithm_machines, sign},
+  };
+  use k256::{elliptic_curve::bigint::ArrayEncoding, Scalar, U256};
+  use rand_core::OsRng;
 
-  const MESSAGE: &'static [u8] = b"Hello, World!";
-  let hashed_message = keccak256(MESSAGE);
+  let hashed_message = keccak256(message);
   let chain_id = U256::from(Scalar::from(chain_id.as_u32()));
 
   let full_message = &[chain_id.to_be_byte_array().as_slice(), &hashed_message].concat();
@@ -67,8 +66,30 @@ async fn test_call_router_execute() {
     algorithm_machines(&mut OsRng, Schnorr::<Secp256k1, crypto::EthereumHram>::new(), &keys),
     full_message,
   );
-  let processed_sig =
-    crypto::process_signature_for_contract(hashed_message, &sig.R, sig.s, &group_key, chain_id);
+  crypto::process_signature_for_contract(hashed_message, &sig.R, sig.s, &group_key, chain_id)
+}
+
+#[tokio::test]
+async fn test_call_router_execute() {
+  let (keys, group_key): (HashMap<u16, FrostKeys<Secp256k1>>, ProjectivePoint) =
+    generate_keys().await;
+
+  let anvil = Anvil::new().spawn();
+  let wallet: LocalWallet = anvil.keys()[0].clone().into();
+  let provider =
+    Provider::<Http>::try_from(anvil.endpoint()).unwrap().interval(Duration::from_millis(10u64));
+  let chain_id = provider.get_chainid().await.unwrap();
+  let client = Arc::new(SignerMiddleware::new(provider, wallet));
+
+  let to = H160([0u8; 20]);
+  let value = U256([0u64; 4]);
+  let data = Bytes::from([0]);
+  let tx = router_mod::Transaction { to: to.clone(), value: value.clone(), data: data.clone() };
+  let txs = vec![tx];
+
+  // try with wrong message
+  const MESSAGE: &'static [u8] = b"Hello, World!";
+  let processed_sig = hash_and_sign(MESSAGE, &keys, &group_key, chain_id).await;
 
   let contract = deploy_router_contract(client.clone()).await.unwrap();
   let res = call_router_execute(&contract, txs.clone(), &processed_sig).await;
@@ -81,35 +102,16 @@ async fn test_call_router_execute() {
     abi::Token::Bytes(data.to_vec()),
   ])])];
   let encoded_calldata = abi::encode(&tokens);
-  let hashed_message = keccak256(encoded_calldata);
-
-  let full_message = &[chain_id.to_be_byte_array().as_slice(), &hashed_message].concat();
-
-  let sig = sign(
-    &mut OsRng,
-    algorithm_machines(&mut OsRng, Schnorr::<Secp256k1, crypto::EthereumHram>::new(), &keys),
-    full_message,
-  );
-  let processed_sig =
-    crypto::process_signature_for_contract(hashed_message, &sig.R, sig.s, &group_key, chain_id);
-
+  let processed_sig = hash_and_sign(&encoded_calldata, &keys, &group_key, chain_id).await;
   let contract = deploy_router_contract(client).await.unwrap();
-  call_router_execute(&contract, txs.clone(), &processed_sig).await.unwrap();
-  call_router_execute_no_abi_encode(&contract, txs, &processed_sig).await.unwrap();
+  let receipt = call_router_execute(&contract, txs.clone(), &processed_sig).await.unwrap().unwrap();
+  println!("gas used: {:?}", receipt.cumulative_gas_used);
 }
 
 #[tokio::test]
 async fn test_ecrecover_hack() {
-  use ethereum_serai::crypto;
-  use ethers::utils::keccak256;
-  use frost::{
-    algorithm::Schnorr,
-    curve::Secp256k1,
-    tests::{algorithm_machines, key_gen, sign},
-  };
-  use k256::elliptic_curve::bigint::ArrayEncoding;
-  use k256::{Scalar, U256};
-  use rand_core::OsRng;
+  let (keys, group_key): (HashMap<u16, FrostKeys<Secp256k1>>, ProjectivePoint) =
+    generate_keys().await;
 
   let anvil = Anvil::new().spawn();
   let wallet: LocalWallet = anvil.keys()[0].clone().into();
@@ -118,22 +120,8 @@ async fn test_ecrecover_hack() {
   let chain_id = provider.get_chainid().await.unwrap();
   let client = Arc::new(SignerMiddleware::new(provider, wallet));
 
-  let keys = key_gen::<_, Secp256k1>(&mut OsRng);
-  let group_key = keys[&1].group_key();
-
   const MESSAGE: &'static [u8] = b"Hello, World!";
-  let hashed_message = keccak256(MESSAGE);
-  let chain_id = U256::from(Scalar::from(chain_id.as_u32()));
-
-  let full_message = &[chain_id.to_be_byte_array().as_slice(), &hashed_message].concat();
-
-  let sig = sign(
-    &mut OsRng,
-    algorithm_machines(&mut OsRng, Schnorr::<Secp256k1, crypto::EthereumHram>::new(), &keys),
-    full_message,
-  );
-  let mut processed_sig =
-    crypto::process_signature_for_contract(hashed_message, &sig.R, sig.s, &group_key, chain_id);
+  let mut processed_sig = hash_and_sign(MESSAGE, &keys, &group_key, chain_id).await;
 
   let contract = deploy_schnorr_verifier_contract(client).await.unwrap();
   call_verify(&contract, &processed_sig).await.unwrap();
