@@ -27,8 +27,6 @@ pub use kp256::{P256, IetfP256Hram};
 /// Set of errors for curve-related operations, namely encoding and decoding
 #[derive(Clone, Error, Debug)]
 pub enum CurveError {
-  #[error("invalid length for data (expected {0}, got {0})")]
-  InvalidLength(usize, usize),
   #[error("invalid scalar")]
   InvalidScalar,
   #[error("invalid point")]
@@ -53,14 +51,14 @@ pub trait Curve: Clone + Copy + PartialEq + Eq + Debug + Zeroize {
 
   /// Generator for the group
   // While group does provide this in its API, privacy coins may want to use a custom basepoint
-  const GENERATOR: Self::G;
+  fn generator() -> Self::G;
 
   /// Hash the message for the binding factor. H3 from the IETF draft
   // This doesn't actually need to be part of Curve as it does nothing with the curve
   // This also solely relates to FROST and with a proper Algorithm/HRAM, all projects using
   // aggregatable signatures over this curve will work without issue
-  // It is kept here as Curve + H{1, 2, 3} is effectively a ciphersuite according to the IETF draft
-  // and moving it to Schnorr would force all of them into being ciphersuite-specific
+  // It is kept here as Curve + H{1, 2, 3, 4} is effectively a ciphersuite according to the IETF
+  // draft and moving it to Schnorr would force all of them into being ciphersuite-specific
   // H2 is left to the Schnorr Algorithm as H2 is the H used in HRAM, which Schnorr further
   // modularizes
   fn hash_msg(msg: &[u8]) -> Vec<u8>;
@@ -78,7 +76,7 @@ pub trait Curve: Clone + Copy + PartialEq + Eq + Debug + Zeroize {
 
     seed.extend(repr.as_ref());
     for i in repr.as_mut() {
-      *i = 0;
+      i.zeroize();
     }
 
     let res = Self::hash_to_F(b"nonce", &seed);
@@ -112,7 +110,7 @@ pub trait Curve: Clone + Copy + PartialEq + Eq + Debug + Zeroize {
     let res =
       Option::<Self::F>::from(Self::F::from_repr(encoding)).ok_or(CurveError::InvalidScalar);
     for b in encoding.as_mut() {
-      *b = 0;
+      b.zeroize();
     }
     res
   }
