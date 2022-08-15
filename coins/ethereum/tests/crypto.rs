@@ -1,19 +1,22 @@
 use ethereum_serai::crypto::*;
-use frost::curve::Secp256k1;
-use k256::{
-  elliptic_curve::{bigint::ArrayEncoding, ops::Reduce, sec1::ToEncodedPoint},
-  ProjectivePoint, Scalar, U256,
+use frost::{
+  algorithm::Schnorr,
+  curve::Secp256k1,
+  tests::{algorithm_machines, key_gen, sign},
 };
-
-#[test]
-fn test_ecrecover() {
-  use k256::ecdsa::{
+use k256::{
+  ecdsa::{
     recoverable::Signature,
     signature::{Signer, Verifier},
     SigningKey, VerifyingKey,
-  };
-  use rand_core::OsRng;
+  },
+  elliptic_curve::{bigint::ArrayEncoding, ops::Reduce, sec1::ToEncodedPoint},
+  ProjectivePoint, Scalar, U256,
+};
+use rand_core::OsRng;
 
+#[test]
+fn test_ecrecover() {
   let private = SigningKey::random(&mut OsRng);
   let public = VerifyingKey::from(&private);
 
@@ -29,12 +32,6 @@ fn test_ecrecover() {
 
 #[test]
 fn test_signing() {
-  use frost::{
-    algorithm::Schnorr,
-    tests::{algorithm_machines, key_gen, sign},
-  };
-  use rand_core::OsRng;
-
   let keys = key_gen::<_, Secp256k1>(&mut OsRng);
   let _group_key = keys[&1].group_key();
 
@@ -49,12 +46,6 @@ fn test_signing() {
 
 #[test]
 fn test_ecrecover_hack() {
-  use frost::{
-    algorithm::Schnorr,
-    tests::{algorithm_machines, key_gen, sign},
-  };
-  use rand_core::OsRng;
-
   let keys = key_gen::<_, Secp256k1>(&mut OsRng);
   let group_key = keys[&1].group_key();
   let group_key_encoded = group_key.to_encoded_point(true);
