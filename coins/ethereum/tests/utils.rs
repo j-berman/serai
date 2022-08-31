@@ -13,13 +13,13 @@ use ethers::{
 use rand_core::OsRng;
 use std::collections::HashMap;
 
-pub async fn generate_keys() -> (HashMap<u16, FrostKeys<Secp256k1>>, ProjectivePoint) {
+pub(crate) async fn generate_keys() -> (HashMap<u16, FrostKeys<Secp256k1>>, ProjectivePoint) {
   let keys = key_gen::<_, Secp256k1>(&mut OsRng);
   let group_key = keys[&1].group_key();
   (keys, group_key)
 }
 
-pub async fn hash_and_sign(
+pub(crate) async fn hash_and_sign(
   message: &[u8],
   keys: &HashMap<u16, FrostKeys<Secp256k1>>,
   group_key: &ProjectivePoint,

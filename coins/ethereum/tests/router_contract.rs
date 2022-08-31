@@ -20,7 +20,7 @@ async fn test_deploy_router_contract() {
   let wallet: LocalWallet = anvil.keys()[0].clone().into();
   let provider =
     Provider::<Http>::try_from(anvil.endpoint()).unwrap().interval(Duration::from_millis(10u64));
-  let client = Arc::new(SignerMiddleware::new(provider, wallet));
+  let client = Arc::new(SignerMiddleware::new_with_provider_chain(provider, wallet).await.unwrap());
   let _contract = deploy_router_contract(client).await.unwrap();
 }
 
@@ -34,7 +34,7 @@ async fn test_router_execute() {
   let provider =
     Provider::<Http>::try_from(anvil.endpoint()).unwrap().interval(Duration::from_millis(10u64));
   let chain_id = provider.get_chainid().await.unwrap();
-  let client = Arc::new(SignerMiddleware::new(provider, wallet));
+  let client = Arc::new(SignerMiddleware::new_with_provider_chain(provider, wallet).await.unwrap());
 
   // deploy and set public key
   let contract = deploy_router_contract(client.clone()).await.unwrap();
