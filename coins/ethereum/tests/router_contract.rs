@@ -1,6 +1,6 @@
 use ethereum_serai::{
   crypto::PublicKey,
-  router_contract::{router_execute, router_set_public_key, deploy_router_contract, router_mod},
+  router_contract::{router_execute, router_set_public_key, deploy_router_contract, router::*},
 };
 use frost::{curve::Secp256k1, FrostKeys};
 use k256::ProjectivePoint;
@@ -45,12 +45,8 @@ async fn test_router_execute() {
   let value = U256([0u64; 4]);
   let gas = U256::from(7000000); // arbitrary
   let data = Bytes::from([0]);
-  let tx = router_mod::Transaction {
-    to: to.clone(),
-    value: value.clone(),
-    gas: gas.clone(),
-    data: data.clone(),
-  };
+  let tx =
+    Rtransaction { to: to.clone(), value: value.clone(), gas: gas.clone(), data: data.clone() };
   let txs = vec![tx];
 
   // try with wrong message
