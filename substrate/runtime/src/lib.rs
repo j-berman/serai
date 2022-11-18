@@ -216,8 +216,6 @@ impl pallet_contracts::Config for Runtime {
   type MaxStorageKeyLen = ConstU32<128>;
 }
 
-impl pallet_tendermint::Config for Runtime {}
-
 const SESSION_LENGTH: BlockNumber = 5 * DAYS;
 type Sessions = PeriodicSessions<ConstU32<{ SESSION_LENGTH }>, ConstU32<{ SESSION_LENGTH }>>;
 
@@ -239,6 +237,12 @@ impl pallet_session::Config for Runtime {
   type Keys = SessionKeys;
   type WeightInfo = pallet_session::weights::SubstrateWeight<Runtime>;
 }
+
+impl staking_pallet::Config for Runtime {
+  type Currency = Balances;
+}
+
+impl pallet_tendermint::Config for Runtime {}
 
 pub type Address = AccountId;
 pub type Header = generic::Header<BlockNumber, BlakeTwo256>;
@@ -276,7 +280,9 @@ construct_runtime!(
     Balances: pallet_balances,
     TransactionPayment: pallet_transaction_payment,
     Contracts: pallet_contracts,
+
     Session: pallet_session,
+    Staking: staking_pallet,
     Tendermint: pallet_tendermint,
   }
 );

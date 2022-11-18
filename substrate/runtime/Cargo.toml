@@ -45,6 +45,7 @@ pallet-contracts-primitives = { git = "https://github.com/serai-dex/substrate", 
 pallet-contracts = { git = "https://github.com/serai-dex/substrate", default-features = false }
 
 pallet-session = { git = "https://github.com/serai-dex/substrate", default-features = false }
+staking-pallet = { path = "../staking/pallet", default-features = false }
 pallet-tendermint = { path = "../tendermint/pallet", default-features = false }
 
 frame-system-rpc-runtime-api = { git = "https://github.com/serai-dex/substrate", default-features = false }
