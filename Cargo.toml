@@ -21,6 +21,9 @@ members = [
 
   "processor",
 
+  "substrate/staking/primitives",
+  "substrate/staking/pallet",
+
   "substrate/tendermint/machine",
   "substrate/tendermint/primitives",
   "substrate/tendermint/client",
