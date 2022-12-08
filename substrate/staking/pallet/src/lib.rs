@@ -152,6 +152,7 @@ pub mod pallet {
       Ok(())
     }
 
+    // TODO: Assign an allocation ID so a fault module can't deallocate from another
     fn allocate_internal(account: &T::AccountId, amount: u64) -> Result<(), Error<T>> {
       Allocated::<T>::try_mutate(account, |allocated| {
         let available = Self::bond(account) - *allocated;
@@ -199,7 +200,7 @@ pub mod pallet {
       origin: OriginFor<T>,
       from: T::AccountId,
       to: T::AccountId,
-      amount: u64,
+      #[pallet::compact] amount: u64,
     ) -> DispatchResult {
       let signer = ensure_signed(origin)?;
       Self::move_delegation(&signer, &from, &to, amount)?;
