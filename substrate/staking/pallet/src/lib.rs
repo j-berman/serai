@@ -12,17 +12,25 @@ pub mod pallet {
 
   use staking_primitives::AllocatedStaking;
 
+  #[pallet::config]
+  pub trait Config: frame_system::Config {
+    type RuntimeEvent: IsType<<Self as frame_system::Config>::RuntimeEvent> + From<Event<Self>>;
+    type Currency: Currency<Self::AccountId, Balance = u64>;
+  }
+
+  #[pallet::event]
+  #[pallet::generate_deposit(pub(super) fn deposit_event)]
+  pub enum Event<T: Config> {
+    Stake { staker: T::AccountId, amount: u64 },
+    Delegate { delegator: T::AccountId, delegatee: T::AccountId, amount: u64 },
+    Undelegate { delegator: T::AccountId, delegatee: T::AccountId, amount: u64 },
+    Unstake { staker: T::AccountId, amount: u64 },
+  }
+
   #[pallet::error]
   pub enum Error<T> {
     BondUnavailable,
     InsufficientDelegation,
-  }
-
-  // TODO: Event
-
-  #[pallet::config]
-  pub trait Config: frame_system::Config {
-    type Currency: Currency<Self::AccountId, Balance = u64>;
   }
 
   #[pallet::pallet]
@@ -70,6 +78,11 @@ pub mod pallet {
     fn add_delegation(from: &T::AccountId, to: &T::AccountId, amount: u64) {
       Delegations::<T>::mutate(from, to, |delegated| *delegated += amount);
       Bond::<T>::mutate(to, |bond| *bond += amount);
+      Self::deposit_event(Event::Delegate {
+        delegator: from.clone(),
+        delegatee: to.clone(),
+        amount,
+      });
     }
 
     fn remove_delegation(from: &T::AccountId, to: &T::AccountId, amount: u64) -> DispatchResult {
@@ -93,13 +106,22 @@ pub mod pallet {
           Err(Error::<T>::InsufficientDelegation)?;
         }
         *delegated -= amount;
-        Ok(())
-      })
+        Ok::<_, DispatchError>(())
+      })?;
+
+      Self::deposit_event(Event::Undelegate {
+        delegator: from.clone(),
+        delegatee: to.clone(),
+        amount,
+      });
+
+      Ok(())
     }
 
     fn add_stake(account: &T::AccountId, delegate: &T::AccountId, amount: u64) {
       Staked::<T>::mutate(account, |staked| *staked += amount);
       Self::add_delegation(account, delegate, amount);
+      Self::deposit_event(Event::Stake { staker: account.clone(), amount });
     }
 
     fn remove_stake(
@@ -115,6 +137,7 @@ pub mod pallet {
         }
         *staked -= amount;
       });
+      Self::deposit_event(Event::Unstake { staker: account.clone(), amount });
       Ok(())
     }
 
