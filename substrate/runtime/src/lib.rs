@@ -239,6 +239,7 @@ impl pallet_session::Config for Runtime {
 }
 
 impl staking_pallet::Config for Runtime {
+  type RuntimeEvent = RuntimeEvent;
   type Currency = Balances;
 }
 
