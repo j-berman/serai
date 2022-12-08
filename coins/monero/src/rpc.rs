@@ -27,7 +27,7 @@ pub struct JsonRpcResponse<T> {
 #[derive(Deserialize, Debug)]
 struct TransactionResponse {
   tx_hash: String,
-  block_height: usize,
+  block_height: Option<usize>,
   as_hex: String,
   pruned_as_hex: String,
 }
@@ -274,7 +274,7 @@ impl Rpc {
     self.get_transactions(&[tx]).await.map(|mut txs| txs.swap_remove(0))
   }
 
-  pub async fn get_transaction_block_number(&self, tx: &[u8]) -> Result<usize, RpcError> {
+  pub async fn get_transaction_block_number(&self, tx: &[u8]) -> Result<Option<usize>, RpcError> {
     let txs: TransactionsResponse =
       self.rpc_call("get_transactions", Some(json!({ "txs_hashes": [hex::encode(tx)] }))).await?;
 
@@ -474,6 +474,23 @@ impl Rpc {
     if res.status != "OK" {
       Err(RpcError::InvalidTransaction(tx.hash()))?;
     }
+
+    Ok(())
+  }
+
+  pub async fn generate_blocks(&self, address: &str, block_count: usize) -> Result<(), RpcError> {
+    self
+      .rpc_call::<_, EmptyResponse>(
+        "json_rpc",
+        Some(json!({
+          "method": "generateblocks",
+          "params": {
+            "wallet_address": address,
+            "amount_of_blocks": block_count
+          },
+        })),
+      )
+      .await?;
 
     Ok(())
   }
