@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read, Write};
 
 use curve25519_dalek::{
   scalar::Scalar,
@@ -11,11 +11,11 @@ pub(crate) fn varint_len(varint: usize) -> usize {
   ((usize::try_from(usize::BITS - varint.leading_zeros()).unwrap().saturating_sub(1)) / 7) + 1
 }
 
-pub(crate) fn write_byte<W: io::Write>(byte: &u8, w: &mut W) -> io::Result<()> {
+pub(crate) fn write_byte<W: Write>(byte: &u8, w: &mut W) -> io::Result<()> {
   w.write_all(&[*byte])
 }
 
-pub(crate) fn write_varint<W: io::Write>(varint: &u64, w: &mut W) -> io::Result<()> {
+pub(crate) fn write_varint<W: Write>(varint: &u64, w: &mut W) -> io::Result<()> {
   let mut varint = *varint;
   while {
     let mut b = u8::try_from(varint & u64::from(!VARINT_CONTINUATION_MASK)).unwrap();
@@ -29,15 +29,15 @@ pub(crate) fn write_varint<W: io::Write>(varint: &u64, w: &mut W) -> io::Result<
   Ok(())
 }
 
-pub(crate) fn write_scalar<W: io::Write>(scalar: &Scalar, w: &mut W) -> io::Result<()> {
+pub(crate) fn write_scalar<W: Write>(scalar: &Scalar, w: &mut W) -> io::Result<()> {
   w.write_all(&scalar.to_bytes())
 }
 
-pub(crate) fn write_point<W: io::Write>(point: &EdwardsPoint, w: &mut W) -> io::Result<()> {
+pub(crate) fn write_point<W: Write>(point: &EdwardsPoint, w: &mut W) -> io::Result<()> {
   w.write_all(&point.compress().to_bytes())
 }
 
-pub(crate) fn write_raw_vec<T, W: io::Write, F: Fn(&T, &mut W) -> io::Result<()>>(
+pub(crate) fn write_raw_vec<T, W: Write, F: Fn(&T, &mut W) -> io::Result<()>>(
   f: F,
   values: &[T],
   w: &mut W,
@@ -48,7 +48,7 @@ pub(crate) fn write_raw_vec<T, W: io::Write, F: Fn(&T, &mut W) -> io::Result<()>
   Ok(())
 }
 
-pub(crate) fn write_vec<T, W: io::Write, F: Fn(&T, &mut W) -> io::Result<()>>(
+pub(crate) fn write_vec<T, W: Write, F: Fn(&T, &mut W) -> io::Result<()>>(
   f: F,
   values: &[T],
   w: &mut W,
@@ -57,25 +57,25 @@ pub(crate) fn write_vec<T, W: io::Write, F: Fn(&T, &mut W) -> io::Result<()>>(
   write_raw_vec(f, values, w)
 }
 
-pub(crate) fn read_bytes<R: io::Read, const N: usize>(r: &mut R) -> io::Result<[u8; N]> {
+pub(crate) fn read_bytes<R: Read, const N: usize>(r: &mut R) -> io::Result<[u8; N]> {
   let mut res = [0; N];
   r.read_exact(&mut res)?;
   Ok(res)
 }
 
-pub(crate) fn read_byte<R: io::Read>(r: &mut R) -> io::Result<u8> {
+pub(crate) fn read_byte<R: Read>(r: &mut R) -> io::Result<u8> {
   Ok(read_bytes::<_, 1>(r)?[0])
 }
 
-pub(crate) fn read_u64<R: io::Read>(r: &mut R) -> io::Result<u64> {
+pub(crate) fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
   read_bytes(r).map(u64::from_le_bytes)
 }
 
-pub(crate) fn read_u32<R: io::Read>(r: &mut R) -> io::Result<u32> {
+pub(crate) fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
   read_bytes(r).map(u32::from_le_bytes)
 }
 
-pub(crate) fn read_varint<R: io::Read>(r: &mut R) -> io::Result<u64> {
+pub(crate) fn read_varint<R: Read>(r: &mut R) -> io::Result<u64> {
   let mut bits = 0;
   let mut res = 0;
   while {
@@ -94,13 +94,18 @@ pub(crate) fn read_varint<R: io::Read>(r: &mut R) -> io::Result<u64> {
   Ok(res)
 }
 
-// TODO: https://github.com/serai-dex/serai/issues/25
-pub(crate) fn read_scalar<R: io::Read>(r: &mut R) -> io::Result<Scalar> {
+// All scalar fields supported by monero-serai are checked to be canonical for valid transactions
+// While from_bytes_mod_order would be more flexible, it's not currently needed and would be
+// inaccurate to include now. While casting a wide net may be preferable, it'd also be inaccurate
+// for now. There's also further edge cases as noted by
+// https://github.com/monero-project/monero/issues/8438, where some scalars had an archaic
+// reduction applied
+pub(crate) fn read_scalar<R: Read>(r: &mut R) -> io::Result<Scalar> {
   Scalar::from_canonical_bytes(read_bytes(r)?)
     .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "unreduced scalar"))
 }
 
-pub(crate) fn read_point<R: io::Read>(r: &mut R) -> io::Result<EdwardsPoint> {
+pub(crate) fn read_point<R: Read>(r: &mut R) -> io::Result<EdwardsPoint> {
   let bytes = read_bytes(r)?;
   CompressedEdwardsY(bytes)
     .decompress()
@@ -109,14 +114,14 @@ pub(crate) fn read_point<R: io::Read>(r: &mut R) -> io::Result<EdwardsPoint> {
     .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "invalid point"))
 }
 
-pub(crate) fn read_torsion_free_point<R: io::Read>(r: &mut R) -> io::Result<EdwardsPoint> {
+pub(crate) fn read_torsion_free_point<R: Read>(r: &mut R) -> io::Result<EdwardsPoint> {
   read_point(r)
     .ok()
     .filter(|point| point.is_torsion_free())
     .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "invalid point"))
 }
 
-pub(crate) fn read_raw_vec<R: io::Read, T, F: Fn(&mut R) -> io::Result<T>>(
+pub(crate) fn read_raw_vec<R: Read, T, F: Fn(&mut R) -> io::Result<T>>(
   f: F,
   len: usize,
   r: &mut R,
@@ -128,7 +133,7 @@ pub(crate) fn read_raw_vec<R: io::Read, T, F: Fn(&mut R) -> io::Result<T>>(
   Ok(res)
 }
 
-pub(crate) fn read_vec<R: io::Read, T, F: Fn(&mut R) -> io::Result<T>>(
+pub(crate) fn read_vec<R: Read, T, F: Fn(&mut R) -> io::Result<T>>(
   f: F,
   r: &mut R,
 ) -> io::Result<Vec<T>> {

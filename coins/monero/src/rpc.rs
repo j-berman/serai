@@ -5,9 +5,10 @@ use thiserror::Error;
 use curve25519_dalek::edwards::{EdwardsPoint, CompressedEdwardsY};
 
 use serde::{Serialize, Deserialize, de::DeserializeOwned};
-use serde_json::json;
+use serde_json::{Value, json};
 
-use reqwest;
+use digest_auth::AuthContext;
+use reqwest::{Client, RequestBuilder};
 
 use crate::{
   Protocol,
@@ -23,12 +24,28 @@ pub struct JsonRpcResponse<T> {
   result: T,
 }
 
-#[derive(Clone, Error, Debug)]
+#[derive(Deserialize, Debug)]
+struct TransactionResponse {
+  tx_hash: String,
+  block_height: Option<usize>,
+  as_hex: String,
+  pruned_as_hex: String,
+}
+#[derive(Deserialize, Debug)]
+struct TransactionsResponse {
+  #[serde(default)]
+  missed_tx: Vec<String>,
+  txs: Vec<TransactionResponse>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Error)]
 pub enum RpcError {
   #[error("internal error ({0})")]
-  InternalError(String),
+  InternalError(&'static str),
   #[error("connection error")]
   ConnectionError,
+  #[error("invalid node")]
+  InvalidNode,
   #[error("transactions not found")]
   TransactionsNotFound(Vec<[u8; 32]>),
   #[error("invalid point ({0})")]
@@ -40,7 +57,11 @@ pub enum RpcError {
 }
 
 fn rpc_hex(value: &str) -> Result<Vec<u8>, RpcError> {
-  hex::decode(value).map_err(|_| RpcError::InternalError("Monero returned invalid hex".to_string()))
+  hex::decode(value).map_err(|_| RpcError::InvalidNode)
+}
+
+fn hash_hex(hash: &str) -> Result<[u8; 32], RpcError> {
+  rpc_hex(hash)?.try_into().map_err(|_| RpcError::InvalidNode)
 }
 
 fn rpc_point(point: &str) -> Result<EdwardsPoint, RpcError> {
@@ -52,20 +73,58 @@ fn rpc_point(point: &str) -> Result<EdwardsPoint, RpcError> {
 }
 
 #[derive(Clone, Debug)]
-pub struct Rpc(String);
+pub struct Rpc {
+  client: Client,
+  userpass: Option<(String, String)>,
+  url: String,
+}
 
 impl Rpc {
-  pub fn new(daemon: String) -> Rpc {
-    Rpc(daemon)
+  /// Create a new RPC connection.
+  /// A daemon requiring authentication can be used via including the username and password in the
+  /// URL.
+  pub fn new(mut url: String) -> Result<Rpc, RpcError> {
+    // Parse out the username and password
+    let userpass = if url.contains('@') {
+      let url_clone = url.clone();
+      let split_url = url_clone.split('@').collect::<Vec<_>>();
+      if split_url.len() != 2 {
+        Err(RpcError::InvalidNode)?;
+      }
+      let mut userpass = split_url[0];
+      url = split_url[1].to_string();
+
+      // If there was additionally a protocol string, restore that to the daemon URL
+      if userpass.contains("://") {
+        let split_userpass = userpass.split("://").collect::<Vec<_>>();
+        if split_userpass.len() != 2 {
+          Err(RpcError::InvalidNode)?;
+        }
+        url = split_userpass[0].to_string() + "://" + &url;
+        userpass = split_userpass[1];
+      }
+
+      let split_userpass = userpass.split(':').collect::<Vec<_>>();
+      if split_userpass.len() != 2 {
+        Err(RpcError::InvalidNode)?;
+      }
+      Some((split_userpass[0].to_string(), split_userpass[1].to_string()))
+    } else {
+      None
+    };
+
+    Ok(Rpc { client: Client::new(), userpass, url })
   }
 
+  /// Perform a RPC call to the specified method with the provided parameters.
+  /// This is NOT a JSON-RPC call, which use a method of "json_rpc" and are available via
+  /// `json_rpc_call`.
   pub async fn rpc_call<Params: Serialize + Debug, Response: DeserializeOwned + Debug>(
     &self,
     method: &str,
     params: Option<Params>,
   ) -> Result<Response, RpcError> {
-    let client = reqwest::Client::new();
-    let mut builder = client.post(&(self.0.clone() + "/" + method));
+    let mut builder = self.client.post(self.url.clone() + "/" + method);
     if let Some(params) = params.as_ref() {
       builder = builder.json(params);
     }
@@ -73,32 +132,66 @@ impl Rpc {
     self.call_tail(method, builder).await
   }
 
+  /// Perform a JSON-RPC call to the specified method with the provided parameters
+  pub async fn json_rpc_call<Response: DeserializeOwned + Debug>(
+    &self,
+    method: &str,
+    params: Option<Value>,
+  ) -> Result<Response, RpcError> {
+    let mut req = json!({ "method": method });
+    if let Some(params) = params {
+      req.as_object_mut().unwrap().insert("params".into(), params);
+    }
+    Ok(self.rpc_call::<_, JsonRpcResponse<Response>>("json_rpc", Some(req)).await?.result)
+  }
+
+  /// Perform a binary call to the specified method with the provided parameters.
   pub async fn bin_call<Response: DeserializeOwned + Debug>(
     &self,
     method: &str,
     params: Vec<u8>,
   ) -> Result<Response, RpcError> {
-    let client = reqwest::Client::new();
-    let builder = client.post(&(self.0.clone() + "/" + method)).body(params);
+    let builder = self.client.post(self.url.clone() + "/" + method).body(params.clone());
     self.call_tail(method, builder.header("Content-Type", "application/octet-stream")).await
   }
 
   async fn call_tail<Response: DeserializeOwned + Debug>(
     &self,
     method: &str,
-    builder: reqwest::RequestBuilder,
+    mut builder: RequestBuilder,
   ) -> Result<Response, RpcError> {
+    if let Some((user, pass)) = &self.userpass {
+      let req = self.client.post(&self.url).send().await.map_err(|_| RpcError::InvalidNode)?;
+      // Only provide authentication if this daemon actually expects it
+      if let Some(header) = req.headers().get("www-authenticate") {
+        builder = builder.header(
+          "Authorization",
+          digest_auth::parse(header.to_str().map_err(|_| RpcError::InvalidNode)?)
+            .map_err(|_| RpcError::InvalidNode)?
+            .respond(&AuthContext::new_post::<_, _, _, &[u8]>(
+              user,
+              pass,
+              "/".to_string() + method,
+              None,
+            ))
+            .map_err(|_| RpcError::InvalidNode)?
+            .to_header_string(),
+        );
+      }
+    }
+
     let res = builder.send().await.map_err(|_| RpcError::ConnectionError)?;
 
     Ok(if !method.ends_with(".bin") {
       serde_json::from_str(&res.text().await.map_err(|_| RpcError::ConnectionError)?)
-        .map_err(|_| RpcError::InternalError("Failed to parse JSON response".to_string()))?
+        .map_err(|_| RpcError::InternalError("Failed to parse JSON response"))?
     } else {
       monero_epee_bin_serde::from_bytes(&res.bytes().await.map_err(|_| RpcError::ConnectionError)?)
-        .map_err(|_| RpcError::InternalError("Failed to parse binary response".to_string()))?
+        .map_err(|_| RpcError::InternalError("Failed to parse binary response"))?
     })
   }
 
+  /// Get the active blockchain protocol version.
   pub async fn get_protocol(&self) -> Result<Protocol, RpcError> {
     #[derive(Deserialize, Debug)]
     struct ProtocolResponse {
@@ -112,20 +205,14 @@ impl Rpc {
 
     Ok(
       match self
-        .rpc_call::<_, JsonRpcResponse<LastHeaderResponse>>(
-          "json_rpc",
-          Some(json!({
-            "method": "get_last_block_header"
-          })),
-        )
+        .json_rpc_call::<LastHeaderResponse>("get_last_block_header", None)
         .await?
-        .result
         .block_header
         .major_version
       {
         13 | 14 => Protocol::v14,
         15 | 16 => Protocol::v16,
-        _ => Protocol::Unsupported,
+        version => Protocol::Unsupported(version),
       },
     )
   }
@@ -143,31 +230,18 @@ impl Rpc {
       return Ok(vec![]);
     }
 
-    #[derive(Deserialize, Debug)]
-    struct TransactionResponse {
-      tx_hash: String,
-      as_hex: String,
-      pruned_as_hex: String,
-    }
-    #[derive(Deserialize, Debug)]
-    struct TransactionsResponse {
-      #[serde(default)]
-      missed_tx: Vec<String>,
-      txs: Vec<TransactionResponse>,
-    }
-
     let txs: TransactionsResponse = self
       .rpc_call(
         "get_transactions",
         Some(json!({
-          "txs_hashes": hashes.iter().map(|hash| hex::encode(&hash)).collect::<Vec<_>>()
+          "txs_hashes": hashes.iter().map(hex::encode).collect::<Vec<_>>()
         })),
       )
       .await?;
 
     if !txs.missed_tx.is_empty() {
       Err(RpcError::TransactionsNotFound(
-        txs.missed_tx.iter().map(|hash| hex::decode(&hash).unwrap().try_into().unwrap()).collect(),
+        txs.missed_tx.iter().map(|hash| hash_hex(hash)).collect::<Result<_, _>>()?,
       ))?;
     }
 
@@ -175,11 +249,13 @@ impl Rpc {
       .txs
       .iter()
       .map(|res| {
-        let tx = Transaction::deserialize(&mut std::io::Cursor::new(
-          rpc_hex(if !res.as_hex.is_empty() { &res.as_hex } else { &res.pruned_as_hex }).unwrap(),
-        ))
-        .map_err(|_| {
-          RpcError::InvalidTransaction(hex::decode(&res.tx_hash).unwrap().try_into().unwrap())
+        let tx = Transaction::read::<&[u8]>(
+          &mut rpc_hex(if !res.as_hex.is_empty() { &res.as_hex } else { &res.pruned_as_hex })?
+            .as_ref(),
+        )
+        .map_err(|_| match hash_hex(&res.tx_hash) {
+          Ok(hash) => RpcError::InvalidTransaction(hash),
+          Err(err) => err,
         })?;
 
         // https://github.com/monero-project/monero/issues/8311
@@ -195,37 +271,69 @@ impl Rpc {
       .collect()
   }
 
-  pub async fn get_block(&self, height: usize) -> Result<Block, RpcError> {
+  pub async fn get_transaction(&self, tx: [u8; 32]) -> Result<Transaction, RpcError> {
+    self.get_transactions(&[tx]).await.map(|mut txs| txs.swap_remove(0))
+  }
+
+  pub async fn get_transaction_block_number(&self, tx: &[u8]) -> Result<Option<usize>, RpcError> {
+    let txs: TransactionsResponse =
+      self.rpc_call("get_transactions", Some(json!({ "txs_hashes": [hex::encode(tx)] }))).await?;
+
+    if !txs.missed_tx.is_empty() {
+      Err(RpcError::TransactionsNotFound(
+        txs.missed_tx.iter().map(|hash| hash_hex(hash)).collect::<Result<_, _>>()?,
+      ))?;
+    }
+
+    Ok(txs.txs[0].block_height)
+  }
+
+  pub async fn get_block_hash(&self, number: usize) -> Result<[u8; 32], RpcError> {
+    #[derive(Deserialize, Debug)]
+    struct BlockHeaderResponse {
+      hash: String,
+    }
+    #[derive(Deserialize, Debug)]
+    struct BlockHeaderByHeightResponse {
+      block_header: BlockHeaderResponse,
+    }
+
+    let header: BlockHeaderByHeightResponse =
+      self.json_rpc_call("get_block_header_by_height", Some(json!({ "height": number }))).await?;
+    rpc_hex(&header.block_header.hash)?.try_into().map_err(|_| RpcError::InvalidNode)
+  }
+
+  pub async fn get_block(&self, hash: [u8; 32]) -> Result<Block, RpcError> {
     #[derive(Deserialize, Debug)]
     struct BlockResponse {
       blob: String,
     }
 
-    let block: JsonRpcResponse<BlockResponse> = self
-      .rpc_call(
-        "json_rpc",
-        Some(json!({
-          "method": "get_block",
-          "params": {
-            "height": height
-          }
-        })),
-      )
-      .await?;
+    let res: BlockResponse =
+      self.json_rpc_call("get_block", Some(json!({ "hash": hex::encode(hash) }))).await?;
 
-    Ok(
-      Block::deserialize(&mut std::io::Cursor::new(rpc_hex(&block.result.blob)?))
-        .expect("Monero returned a block we couldn't deserialize"),
-    )
+    Block::read::<&[u8]>(&mut rpc_hex(&res.blob)?.as_ref()).map_err(|_| RpcError::InvalidNode)
   }
 
-  pub async fn get_block_transactions(&self, height: usize) -> Result<Vec<Transaction>, RpcError> {
-    let block = self.get_block(height).await?;
+  pub async fn get_block_by_number(&self, number: usize) -> Result<Block, RpcError> {
+    self.get_block(self.get_block_hash(number).await?).await
+  }
+
+  pub async fn get_block_transactions(&self, hash: [u8; 32]) -> Result<Vec<Transaction>, RpcError> {
+    let block = self.get_block(hash).await?;
     let mut res = vec![block.miner_tx];
     res.extend(self.get_transactions(&block.txs).await?);
     Ok(res)
   }
 
+  pub async fn get_block_transactions_by_number(
+    &self,
+    number: usize,
+  ) -> Result<Vec<Transaction>, RpcError> {
+    self.get_block_transactions(self.get_block_hash(number).await?).await
+  }
+
+  /// Get the output indexes of the specified transaction.
   pub async fn get_o_indexes(&self, hash: [u8; 32]) -> Result<Vec<u64>, RpcError> {
     #[derive(Serialize, Debug)]
     struct Request {
@@ -252,7 +360,8 @@ impl Rpc {
     Ok(indexes.o_indexes)
   }
 
-  // from and to are inclusive
+  /// Get the output distribution, from the specified height to the specified height (both
+  /// inclusive).
   pub async fn get_output_distribution(
     &self,
     from: usize,
@@ -270,25 +379,24 @@ impl Rpc {
       distributions: Vec<Distribution>,
     }
 
-    let mut distributions: JsonRpcResponse<Distributions> = self
-      .rpc_call(
-        "json_rpc",
+    let mut distributions: Distributions = self
+      .json_rpc_call(
+        "get_output_distribution",
         Some(json!({
-          "method": "get_output_distribution",
-          "params": {
-            "binary": false,
-            "amounts": [0],
-            "cumulative": true,
-            "from_height": from,
-            "to_height": to
-          }
+          "binary": false,
+          "amounts": [0],
+          "cumulative": true,
+          "from_height": from,
+          "to_height": to,
         })),
       )
       .await?;
 
-    Ok(distributions.result.distributions.swap_remove(0).distribution)
+    Ok(distributions.distributions.swap_remove(0).distribution)
   }
 
+  /// Get the specified outputs from the RingCT (zero-amount) pool, but only return them if they're
+  /// unlocked.
   pub async fn get_unlocked_outputs(
     &self,
     indexes: &[u64],
@@ -324,13 +432,8 @@ impl Rpc {
         &outs
           .outs
           .iter()
-          .map(|out| {
-            rpc_hex(&out.txid)
-              .expect("Monero returned an invalidly encoded hash")
-              .try_into()
-              .expect("Monero returned an invalid sized hash")
-          })
-          .collect::<Vec<_>>(),
+          .map(|out| rpc_hex(&out.txid)?.try_into().map_err(|_| RpcError::InvalidNode))
+          .collect::<Result<Vec<_>, _>>()?,
       )
       .await?;
 
@@ -350,6 +453,9 @@ impl Rpc {
       .collect()
   }
 
+  /// Get the currently estimated fee from the node. This may be manipulated to unsafe levels and
+  /// MUST be sanity checked.
+  // TODO: Take a sanity check argument
   pub async fn get_fee(&self) -> Result<Fee, RpcError> {
     #[allow(dead_code)]
     #[derive(Deserialize, Debug)]
@@ -358,16 +464,8 @@ impl Rpc {
       quantization_mask: u64,
     }
 
-    let res: JsonRpcResponse<FeeResponse> = self
-      .rpc_call(
-        "json_rpc",
-        Some(json!({
-          "method": "get_fee_estimate"
-        })),
-      )
-      .await?;
-
-    Ok(Fee { per_weight: res.result.fee, mask: res.result.quantization_mask })
+    let res: FeeResponse = self.json_rpc_call("get_fee_estimate", None).await?;
+    Ok(Fee { per_weight: res.fee, mask: res.quantization_mask })
   }
 
   pub async fn publish_transaction(&self, tx: &Transaction) -> Result<(), RpcError> {
@@ -388,7 +486,7 @@ impl Rpc {
     }
 
     let mut buf = Vec::with_capacity(2048);
-    tx.serialize(&mut buf).unwrap();
+    tx.write(&mut buf).unwrap();
     let res: SendRawResponse = self
       .rpc_call("send_raw_transaction", Some(json!({ "tx_as_hex": hex::encode(&buf) })))
       .await?;
@@ -396,6 +494,23 @@ impl Rpc {
     if res.status != "OK" {
       Err(RpcError::InvalidTransaction(tx.hash()))?;
     }
+
+    Ok(())
+  }
+
+  pub async fn generate_blocks(&self, address: &str, block_count: usize) -> Result<(), RpcError> {
+    self
+      .rpc_call::<_, EmptyResponse>(
+        "json_rpc",
+        Some(json!({
+          "method": "generateblocks",
+          "params": {
+            "wallet_address": address,
+            "amount_of_blocks": block_count
+          },
+        })),
+      )
+      .await?;
 
     Ok(())
   }

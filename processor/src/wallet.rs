@@ -6,9 +6,9 @@ use group::GroupEncoding;
 
 use transcript::{Transcript, RecommendedTranscript};
 use frost::{
-  curve::Curve,
-  FrostKeys,
-  sign::{PreprocessMachine, SignMachine, SignatureMachine},
+  curve::{Ciphersuite, Curve},
+  FrostError, ThresholdKeys,
+  sign::{Writable, PreprocessMachine, SignMachine, SignatureMachine},
 };
 
 use crate::{
@@ -17,13 +17,13 @@ use crate::{
 };
 
 pub struct WalletKeys<C: Curve> {
-  keys: FrostKeys<C>,
-  creation_height: usize,
+  keys: ThresholdKeys<C>,
+  creation_block: usize,
 }
 
 impl<C: Curve> WalletKeys<C> {
-  pub fn new(keys: FrostKeys<C>, creation_height: usize) -> WalletKeys<C> {
-    WalletKeys { keys, creation_height }
+  pub fn new(keys: ThresholdKeys<C>, creation_block: usize) -> WalletKeys<C> {
+    WalletKeys { keys, creation_block }
   }
 
   // Bind this key to a specific network by applying an additive offset
@@ -34,53 +34,53 @@ impl<C: Curve> WalletKeys<C> {
   // system, there are potentially other benefits to binding this to a specific group key
   // It's no longer possible to influence group key gen to key cancel without breaking the hash
   // function as well, although that degree of influence means key gen is broken already
-  fn bind(&self, chain: &[u8]) -> FrostKeys<C> {
+  fn bind(&self, chain: &[u8]) -> ThresholdKeys<C> {
     const DST: &[u8] = b"Serai Processor Wallet Chain Bind";
     let mut transcript = RecommendedTranscript::new(DST);
     transcript.append_message(b"chain", chain);
     transcript.append_message(b"curve", C::ID);
-    transcript.append_message(b"group_key", self.keys.group_key().to_bytes().as_ref());
-    self.keys.offset(C::hash_to_F(DST, &transcript.challenge(b"offset")))
+    transcript.append_message(b"group_key", self.keys.group_key().to_bytes());
+    self.keys.offset(<C as Ciphersuite>::hash_to_F(DST, &transcript.challenge(b"offset")))
   }
 }
 
 pub trait CoinDb {
-  // Set a height as scanned to
-  fn scanned_to_height(&mut self, height: usize);
-  // Acknowledge a given coin height for a canonical height
-  fn acknowledge_height(&mut self, canonical: usize, height: usize);
+  // Set a block as scanned to
+  fn scanned_to_block(&mut self, block: usize);
+  // Acknowledge a specific block number as part of a canonical block
+  fn acknowledge_block(&mut self, canonical: usize, block: usize);
 
   // Adds an output to the DB. Returns false if the output was already added
   fn add_output<O: Output>(&mut self, output: &O) -> bool;
 
-  // Height this coin has been scanned to
-  fn scanned_height(&self) -> usize;
-  // Acknowledged height for a given canonical height
-  fn acknowledged_height(&self, canonical: usize) -> usize;
+  // Block this coin has been scanned to (inclusive)
+  fn scanned_block(&self) -> usize;
+  // Acknowledged block for a given canonical block
+  fn acknowledged_block(&self, canonical: usize) -> usize;
 }
 
 pub struct MemCoinDb {
-  // Height this coin has been scanned to
-  scanned_height: usize,
-  // Acknowledged height for a given canonical height
-  acknowledged_heights: HashMap<usize, usize>,
+  // Block number of the block this coin has been scanned to
+  scanned_block: usize,
+  // Acknowledged block for a given canonical block
+  acknowledged_blocks: HashMap<usize, usize>,
   outputs: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl MemCoinDb {
   pub fn new() -> MemCoinDb {
-    MemCoinDb { scanned_height: 0, acknowledged_heights: HashMap::new(), outputs: HashMap::new() }
+    MemCoinDb { scanned_block: 0, acknowledged_blocks: HashMap::new(), outputs: HashMap::new() }
   }
 }
 
 impl CoinDb for MemCoinDb {
-  fn scanned_to_height(&mut self, height: usize) {
-    self.scanned_height = height;
+  fn scanned_to_block(&mut self, block: usize) {
+    self.scanned_block = block;
   }
 
-  fn acknowledge_height(&mut self, canonical: usize, height: usize) {
-    debug_assert!(!self.acknowledged_heights.contains_key(&canonical));
-    self.acknowledged_heights.insert(canonical, height);
+  fn acknowledge_block(&mut self, canonical: usize, block: usize) {
+    debug_assert!(!self.acknowledged_blocks.contains_key(&canonical));
+    self.acknowledged_blocks.insert(canonical, block);
   }
 
   fn add_output<O: Output>(&mut self, output: &O) -> bool {
@@ -96,19 +96,19 @@ impl CoinDb for MemCoinDb {
     true
   }
 
-  fn scanned_height(&self) -> usize {
-    self.scanned_height
+  fn scanned_block(&self) -> usize {
+    self.scanned_block
   }
 
-  fn acknowledged_height(&self, canonical: usize) -> usize {
-    self.acknowledged_heights[&canonical]
+  fn acknowledged_block(&self, canonical: usize) -> usize {
+    self.acknowledged_blocks[&canonical]
   }
 }
 
 fn select_inputs<C: Coin>(inputs: &mut Vec<C::Output>) -> (Vec<C::Output>, u64) {
   // Sort to ensure determinism. Inefficient, yet produces the most legible code to be optimized
   // later
-  inputs.sort_by(|a, b| a.amount().cmp(&b.amount()));
+  inputs.sort_by_key(|a| a.amount());
 
   // Select the maximum amount of outputs possible
   let res = inputs.split_off(inputs.len() - C::MAX_INPUTS.min(inputs.len()));
@@ -180,6 +180,7 @@ fn refine_inputs<C: Coin>(
   }
 }
 
+#[allow(clippy::type_complexity)]
 fn select_inputs_outputs<C: Coin>(
   inputs: &mut Vec<C::Output>,
   outputs: &mut Vec<(C::Address, u64)>,
@@ -200,11 +201,12 @@ fn select_inputs_outputs<C: Coin>(
   (selected, outputs)
 }
 
+#[allow(clippy::type_complexity)]
 pub struct Wallet<D: CoinDb, C: Coin> {
   db: D,
   coin: C,
-  keys: Vec<(FrostKeys<C::Curve>, Vec<C::Output>)>,
-  pending: Vec<(usize, FrostKeys<C::Curve>)>,
+  keys: Vec<(ThresholdKeys<C::Curve>, Vec<C::Output>)>,
+  pending: Vec<(usize, ThresholdKeys<C::Curve>)>,
 }
 
 impl<D: CoinDb, C: Coin> Wallet<D, C> {
@@ -212,22 +214,18 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
     Wallet { db, coin, keys: vec![], pending: vec![] }
   }
 
-  pub fn scanned_height(&self) -> usize {
-    self.db.scanned_height()
+  pub fn scanned_block(&self) -> usize {
+    self.db.scanned_block()
   }
-  pub fn acknowledge_height(&mut self, canonical: usize, height: usize) {
-    self.db.acknowledge_height(canonical, height);
-    if height > self.db.scanned_height() {
-      self.db.scanned_to_height(height);
-    }
+  pub fn acknowledge_block(&mut self, canonical: usize, block: usize) {
+    self.db.acknowledge_block(canonical, block);
   }
-  pub fn acknowledged_height(&self, canonical: usize) -> usize {
-    self.db.acknowledged_height(canonical)
+  pub fn acknowledged_block(&self, canonical: usize) -> usize {
+    self.db.acknowledged_block(canonical)
   }
 
   pub fn add_keys(&mut self, keys: &WalletKeys<C::Curve>) {
-    // Doesn't use +1 as this is height, not block index, and poll moves by block index
-    self.pending.push((self.acknowledged_height(keys.creation_height), keys.bind(C::ID)));
+    self.pending.push((self.acknowledged_block(keys.creation_block), keys.bind(C::ID)));
   }
 
   pub fn address(&self) -> C::Address {
@@ -235,13 +233,14 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
   }
 
   pub async fn poll(&mut self) -> Result<(), CoinError> {
-    if self.coin.get_height().await? < C::CONFIRMATIONS {
+    if self.coin.get_latest_block_number().await? < (C::CONFIRMATIONS - 1) {
       return Ok(());
     }
-    let confirmed_block = self.coin.get_height().await? - C::CONFIRMATIONS;
+    let confirmed_block = self.coin.get_latest_block_number().await? - (C::CONFIRMATIONS - 1);
 
-    for b in self.scanned_height() ..= confirmed_block {
-      // If any keys activated at this height, shift them over
+    // Will never scan the genesis block, which shouldn't be an issue
+    for b in (self.scanned_block() + 1) ..= confirmed_block {
+      // If any keys activated at this block, shift them over
       {
         let mut k = 0;
         while k < self.pending.len() {
@@ -269,8 +268,7 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
         );
       }
 
-      // Blocks are zero-indexed while heights aren't
-      self.db.scanned_to_height(b + 1);
+      self.db.scanned_to_block(b);
     }
 
     Ok(())
@@ -291,7 +289,7 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
       return Ok((vec![], vec![]));
     }
 
-    let acknowledged_height = self.acknowledged_height(canonical);
+    let acknowledged_block = self.acknowledged_block(canonical);
 
     // TODO: Log schedule outputs when MAX_OUTPUTS is lower than payments.len()
     // Payments is the first set of TXs in the schedule
@@ -313,16 +311,24 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
         // Create the transcript for this transaction
         let mut transcript = RecommendedTranscript::new(b"Serai Processor Wallet Send");
         transcript
-          .append_message(b"canonical_height", &u64::try_from(canonical).unwrap().to_le_bytes());
+          .append_message(b"canonical_block", u64::try_from(canonical).unwrap().to_le_bytes());
         transcript.append_message(
-          b"acknowledged_height",
-          &u64::try_from(acknowledged_height).unwrap().to_le_bytes(),
+          b"acknowledged_block",
+          u64::try_from(acknowledged_block).unwrap().to_le_bytes(),
         );
-        transcript.append_message(b"index", &u64::try_from(txs.len()).unwrap().to_le_bytes());
+        transcript.append_message(b"index", u64::try_from(txs.len()).unwrap().to_le_bytes());
 
         let tx = self
           .coin
-          .prepare_send(keys.clone(), transcript, acknowledged_height, inputs, &outputs, fee)
+          .prepare_send(
+            keys.clone(),
+            transcript,
+            acknowledged_block,
+            inputs,
+            &outputs,
+            Some(keys.group_key()),
+            fee,
+          )
           .await?;
         // self.db.save_tx(tx) // TODO
         txs.push(tx);
@@ -336,16 +342,40 @@ impl<D: CoinDb, C: Coin> Wallet<D, C> {
     &mut self,
     network: &mut N,
     prepared: C::SignableTransaction,
-    included: Vec<u16>,
   ) -> Result<(Vec<u8>, Vec<<C::Output as Output>::Id>), SignError> {
-    let attempt =
-      self.coin.attempt_send(prepared, &included).await.map_err(SignError::CoinError)?;
+    let attempt = self.coin.attempt_send(prepared).await.map_err(SignError::CoinError)?;
 
     let (attempt, commitments) = attempt.preprocess(&mut OsRng);
-    let commitments = network.round(commitments).await.map_err(SignError::NetworkError)?;
+    let commitments = network
+      .round(commitments.serialize())
+      .await
+      .map_err(SignError::NetworkError)?
+      .drain()
+      .map(|(validator, preprocess)| {
+        Ok((
+          validator,
+          attempt
+            .read_preprocess::<&[u8]>(&mut preprocess.as_ref())
+            .map_err(|_| SignError::FrostError(FrostError::InvalidPreprocess(validator)))?,
+        ))
+      })
+      .collect::<Result<HashMap<_, _>, _>>()?;
 
     let (attempt, share) = attempt.sign(commitments, b"").map_err(SignError::FrostError)?;
-    let shares = network.round(share).await.map_err(SignError::NetworkError)?;
+    let shares = network
+      .round(share.serialize())
+      .await
+      .map_err(SignError::NetworkError)?
+      .drain()
+      .map(|(validator, share)| {
+        Ok((
+          validator,
+          attempt
+            .read_share::<&[u8]>(&mut share.as_ref())
+            .map_err(|_| SignError::FrostError(FrostError::InvalidShare(validator)))?,
+        ))
+      })
+      .collect::<Result<HashMap<_, _>, _>>()?;
 
     let tx = attempt.complete(shares).map_err(SignError::FrostError)?;
 

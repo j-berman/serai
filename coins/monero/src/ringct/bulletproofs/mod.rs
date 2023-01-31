@@ -1,5 +1,7 @@
 #![allow(non_snake_case)]
 
+use std::io::{self, Read, Write};
+
 use rand_core::{RngCore, CryptoRng};
 
 use zeroize::Zeroize;
@@ -23,6 +25,7 @@ pub(crate) use self::plus::PlusStruct;
 
 pub(crate) const MAX_OUTPUTS: usize = self::core::MAX_M;
 
+/// Bulletproofs enum, supporting the original and plus formulations.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Bulletproofs {
@@ -50,6 +53,7 @@ impl Bulletproofs {
       }
   }
 
+  /// Prove the list of commitments are within [0 .. 2^64).
   pub fn prove<R: RngCore + CryptoRng>(
     rng: &mut R,
     outputs: &[Commitment],
@@ -65,6 +69,7 @@ impl Bulletproofs {
     })
   }
 
+  /// Verify the given Bulletproofs.
   #[must_use]
   pub fn verify<R: RngCore + CryptoRng>(&self, rng: &mut R, commitments: &[EdwardsPoint]) -> bool {
     match self {
@@ -73,6 +78,9 @@ impl Bulletproofs {
     }
   }
 
+  /// Accumulate the verification for the given Bulletproofs into the specified BatchVerifier.
+  /// Returns false if the Bulletproofs aren't sane, without mutating the BatchVerifier.
+  /// Returns true if the Bulletproofs are sane, regardless of their validity.
   #[must_use]
   pub fn batch_verify<ID: Copy + Zeroize, R: RngCore + CryptoRng>(
     &self,
@@ -87,11 +95,11 @@ impl Bulletproofs {
     }
   }
 
-  fn serialize_core<W: std::io::Write, F: Fn(&[EdwardsPoint], &mut W) -> std::io::Result<()>>(
+  fn write_core<W: Write, F: Fn(&[EdwardsPoint], &mut W) -> io::Result<()>>(
     &self,
     w: &mut W,
     specific_write_vec: F,
-  ) -> std::io::Result<()> {
+  ) -> io::Result<()> {
     match self {
       Bulletproofs::Original(bp) => {
         write_point(&bp.A, w)?;
@@ -120,15 +128,22 @@ impl Bulletproofs {
     }
   }
 
-  pub(crate) fn signature_serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
-    self.serialize_core(w, |points, w| write_raw_vec(write_point, points, w))
+  pub(crate) fn signature_write<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    self.write_core(w, |points, w| write_raw_vec(write_point, points, w))
   }
 
-  pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
-    self.serialize_core(w, |points, w| write_vec(write_point, points, w))
+  pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    self.write_core(w, |points, w| write_vec(write_point, points, w))
   }
 
-  pub fn deserialize<R: std::io::Read>(r: &mut R) -> std::io::Result<Bulletproofs> {
+  pub fn serialize(&self) -> Vec<u8> {
+    let mut serialized = vec![];
+    self.write(&mut serialized).unwrap();
+    serialized
+  }
+
+  /// Read Bulletproofs.
+  pub fn read<R: Read>(r: &mut R) -> io::Result<Bulletproofs> {
     Ok(Bulletproofs::Original(OriginalStruct {
       A: read_point(r)?,
       S: read_point(r)?,
@@ -144,7 +159,8 @@ impl Bulletproofs {
     }))
   }
 
-  pub fn deserialize_plus<R: std::io::Read>(r: &mut R) -> std::io::Result<Bulletproofs> {
+  /// Read Bulletproofs+.
+  pub fn read_plus<R: Read>(r: &mut R) -> io::Result<Bulletproofs> {
     Ok(Bulletproofs::Plus(PlusStruct {
       A: read_point(r)?,
       A1: read_point(r)?,

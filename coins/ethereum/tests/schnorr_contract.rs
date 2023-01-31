@@ -50,14 +50,20 @@ async fn test_ecrecover_hack() {
   let (chain_id, _anvil, contract) = deploy_test_contract().await;
   let chain_id = U256::from(chain_id);
 
+  let keys = key_gen::<_, Secp256k1>(&mut OsRng);
+  let group_key = keys[&1].group_key();
+
   const MESSAGE: &'static [u8] = b"Hello, World!";
   let hashed_message = keccak256(MESSAGE);
 
   let full_message = &[chain_id.to_be_byte_array().as_slice(), &hashed_message].concat();
 
+  let algo = Algo::<Secp256k1, crypto::EthereumHram>::new();
   let sig = sign(
     &mut OsRng,
-    algorithm_machines(&mut OsRng, Algo::<Secp256k1, crypto::EthereumHram>::new(), &keys),
+    algo.clone(),
+    keys.clone(),
+    algorithm_machines(&mut OsRng, algo, &keys),
     full_message,
   );
   let mut processed_sig =

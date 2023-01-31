@@ -1,29 +1,28 @@
-use std::{io::Cursor, collections::HashMap};
+use std::collections::HashMap;
 
 use rand_core::{RngCore, CryptoRng};
 
-use group::ff::Field;
+pub use dkg::tests::{key_gen, recover_key};
 
 use crate::{
-  Curve, FrostParams, FrostCore, FrostKeys, lagrange,
-  key_gen::KeyGenMachine,
+  Curve, ThresholdKeys,
   algorithm::Algorithm,
-  sign::{PreprocessMachine, SignMachine, SignatureMachine, AlgorithmMachine},
+  sign::{Writable, PreprocessMachine, SignMachine, SignatureMachine, AlgorithmMachine},
 };
 
-// Test suites for public usage
-pub mod curve;
-pub mod schnorr;
-pub mod promote;
+/// Vectorized test suite to ensure consistency.
 pub mod vectors;
 
 // Literal test definitions to run during `cargo test`
 #[cfg(test)]
 mod literal;
 
+/// Constant amount of participants to use when testing.
 pub const PARTICIPANTS: u16 = 5;
+/// Constant threshold of participants to use when signing.
 pub const THRESHOLD: u16 = ((PARTICIPANTS / 3) * 2) + 1;
 
+/// Clone a map without a specific value.
 pub fn clone_without<K: Clone + std::cmp::Eq + std::hash::Hash, V: Clone>(
   map: &HashMap<K, V>,
   without: &K,
@@ -33,81 +32,11 @@ pub fn clone_without<K: Clone + std::cmp::Eq + std::hash::Hash, V: Clone>(
   res
 }
 
-pub fn core_gen<R: RngCore + CryptoRng, C: Curve>(rng: &mut R) -> HashMap<u16, FrostCore<C>> {
-  let mut machines = HashMap::new();
-  let mut commitments = HashMap::new();
-  for i in 1 ..= PARTICIPANTS {
-    let machine = KeyGenMachine::<C>::new(
-      FrostParams::new(THRESHOLD, PARTICIPANTS, i).unwrap(),
-      "FROST Test key_gen".to_string(),
-    );
-    let (machine, these_commitments) = machine.generate_coefficients(rng);
-    machines.insert(i, machine);
-    commitments.insert(i, Cursor::new(these_commitments));
-  }
-
-  let mut secret_shares = HashMap::new();
-  let mut machines = machines
-    .drain()
-    .map(|(l, machine)| {
-      let (machine, shares) =
-        machine.generate_secret_shares(rng, clone_without(&commitments, &l)).unwrap();
-      secret_shares.insert(l, shares);
-      (l, machine)
-    })
-    .collect::<HashMap<_, _>>();
-
-  let mut verification_shares = None;
-  let mut group_key = None;
-  machines
-    .drain()
-    .map(|(i, machine)| {
-      let mut our_secret_shares = HashMap::new();
-      for (l, shares) in &secret_shares {
-        if i == *l {
-          continue;
-        }
-        our_secret_shares.insert(*l, Cursor::new(shares[&i].clone()));
-      }
-      let these_keys = machine.complete(rng, our_secret_shares).unwrap();
-
-      // Verify the verification_shares are agreed upon
-      if verification_shares.is_none() {
-        verification_shares = Some(these_keys.verification_shares());
-      }
-      assert_eq!(verification_shares.as_ref().unwrap(), &these_keys.verification_shares());
-
-      // Verify the group keys are agreed upon
-      if group_key.is_none() {
-        group_key = Some(these_keys.group_key());
-      }
-      assert_eq!(group_key.unwrap(), these_keys.group_key());
-
-      (i, these_keys)
-    })
-    .collect::<HashMap<_, _>>()
-}
-
-pub fn key_gen<R: RngCore + CryptoRng, C: Curve>(rng: &mut R) -> HashMap<u16, FrostKeys<C>> {
-  core_gen(rng).drain().map(|(i, core)| (i, FrostKeys::new(core))).collect()
-}
-
-pub fn recover<C: Curve>(keys: &HashMap<u16, FrostKeys<C>>) -> C::F {
-  let first = keys.values().next().expect("no keys provided");
-  assert!(keys.len() >= first.params().t().into(), "not enough keys provided");
-  let included = keys.keys().cloned().collect::<Vec<_>>();
-
-  let group_private = keys.iter().fold(C::F::zero(), |accum, (i, keys)| {
-    accum + (keys.secret_share() * lagrange::<C::F>(*i, &included))
-  });
-  assert_eq!(C::generator() * group_private, first.group_key(), "failed to recover keys");
-  group_private
-}
-
+/// Spawn algorithm machines for a random selection of signers, each executing the given algorithm.
 pub fn algorithm_machines<R: RngCore, C: Curve, A: Algorithm<C>>(
   rng: &mut R,
   algorithm: A,
-  keys: &HashMap<u16, FrostKeys<C>>,
+  keys: &HashMap<u16, ThresholdKeys<C>>,
 ) -> HashMap<u16, AlgorithmMachine<C, A>> {
   let mut included = vec![];
   while included.len() < usize::from(keys[&1].params().t()) {
@@ -122,10 +51,7 @@ pub fn algorithm_machines<R: RngCore, C: Curve, A: Algorithm<C>>(
     .iter()
     .filter_map(|(i, keys)| {
       if included.contains(i) {
-        Some((
-          *i,
-          AlgorithmMachine::new(algorithm.clone(), keys.clone(), &included.clone()).unwrap(),
-        ))
+        Some((*i, AlgorithmMachine::new(algorithm.clone(), keys.clone()).unwrap()))
       } else {
         None
       }
@@ -133,30 +59,65 @@ pub fn algorithm_machines<R: RngCore, C: Curve, A: Algorithm<C>>(
     .collect()
 }
 
-pub fn sign<R: RngCore + CryptoRng, M: PreprocessMachine>(
+// Run the commit step and generate signature shares
+#[allow(clippy::type_complexity)]
+pub(crate) fn commit_and_shares<
+  R: RngCore + CryptoRng,
+  M: PreprocessMachine,
+  F: FnMut(&mut R, &mut HashMap<u16, M::SignMachine>),
+>(
   rng: &mut R,
   mut machines: HashMap<u16, M>,
+  mut cache: F,
   msg: &[u8],
-) -> M::Signature {
+) -> (
+  HashMap<u16, <M::SignMachine as SignMachine<M::Signature>>::SignatureMachine>,
+  HashMap<u16, <M::SignMachine as SignMachine<M::Signature>>::SignatureShare>,
+) {
   let mut commitments = HashMap::new();
   let mut machines = machines
     .drain()
     .map(|(i, machine)| {
       let (machine, preprocess) = machine.preprocess(rng);
-      commitments.insert(i, Cursor::new(preprocess));
+      commitments.insert(i, {
+        let mut buf = vec![];
+        preprocess.write(&mut buf).unwrap();
+        machine.read_preprocess::<&[u8]>(&mut buf.as_ref()).unwrap()
+      });
       (i, machine)
     })
     .collect::<HashMap<_, _>>();
 
+  cache(rng, &mut machines);
+
   let mut shares = HashMap::new();
-  let mut machines = machines
+  let machines = machines
     .drain()
     .map(|(i, machine)| {
       let (machine, share) = machine.sign(clone_without(&commitments, &i), msg).unwrap();
-      shares.insert(i, Cursor::new(share));
+      shares.insert(i, {
+        let mut buf = vec![];
+        share.write(&mut buf).unwrap();
+        machine.read_share::<&[u8]>(&mut buf.as_ref()).unwrap()
+      });
       (i, machine)
     })
     .collect::<HashMap<_, _>>();
+
+  (machines, shares)
+}
+
+fn sign_internal<
+  R: RngCore + CryptoRng,
+  M: PreprocessMachine,
+  F: FnMut(&mut R, &mut HashMap<u16, M::SignMachine>),
+>(
+  rng: &mut R,
+  machines: HashMap<u16, M>,
+  cache: F,
+  msg: &[u8],
+) -> M::Signature {
+  let (mut machines, shares) = commit_and_shares(rng, machines, cache, msg);
 
   let mut signature = None;
   for (i, machine) in machines.drain() {
@@ -167,4 +128,44 @@ pub fn sign<R: RngCore + CryptoRng, M: PreprocessMachine>(
     assert_eq!(&sig, signature.as_ref().unwrap());
   }
   signature.unwrap()
+}
+
+/// Execute the signing protocol, without caching any machines. This isn't as comprehensive at
+/// testing as sign, and accordingly isn't preferred, yet is usable for machines not supporting
+/// caching.
+pub fn sign_without_caching<R: RngCore + CryptoRng, M: PreprocessMachine>(
+  rng: &mut R,
+  machines: HashMap<u16, M>,
+  msg: &[u8],
+) -> M::Signature {
+  sign_internal(rng, machines, |_, _| {}, msg)
+}
+
+/// Execute the signing protocol, randomly caching various machines to ensure they can cache
+/// successfully.
+pub fn sign<R: RngCore + CryptoRng, M: PreprocessMachine>(
+  rng: &mut R,
+  params: <M::SignMachine as SignMachine<M::Signature>>::Params,
+  mut keys: HashMap<u16, <M::SignMachine as SignMachine<M::Signature>>::Keys>,
+  machines: HashMap<u16, M>,
+  msg: &[u8],
+) -> M::Signature {
+  sign_internal(
+    rng,
+    machines,
+    |rng, machines| {
+      // Cache and rebuild half of the machines
+      let mut included = machines.keys().cloned().collect::<Vec<_>>();
+      for i in included.drain(..) {
+        if (rng.next_u64() % 2) == 0 {
+          let cache = machines.remove(&i).unwrap().cache();
+          machines.insert(
+            i,
+            M::SignMachine::from_cache(params.clone(), keys.remove(&i).unwrap(), cache).unwrap(),
+          );
+        }
+      }
+    },
+    msg,
+  )
 }

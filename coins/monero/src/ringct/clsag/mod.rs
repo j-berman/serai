@@ -1,10 +1,13 @@
 #![allow(non_snake_case)]
 
+use core::ops::Deref;
+use std::io::{self, Read, Write};
+
 use lazy_static::lazy_static;
 use thiserror::Error;
 use rand_core::{RngCore, CryptoRng};
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use subtle::{ConstantTimeEq, Choice, CtOption};
 
 use curve25519_dalek::{
@@ -22,16 +25,19 @@ use crate::{
 #[cfg(feature = "multisig")]
 mod multisig;
 #[cfg(feature = "multisig")]
-pub use multisig::{ClsagDetails, ClsagMultisig};
+pub use multisig::{ClsagDetails, ClsagAddendum, ClsagMultisig};
+#[cfg(feature = "multisig")]
+pub(crate) use multisig::add_key_image_share;
 
 lazy_static! {
   static ref INV_EIGHT: Scalar = Scalar::from(8u8).invert();
 }
 
-#[derive(Clone, Error, Debug)]
+/// Errors returned when CLSAG signing fails.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Error)]
 pub enum ClsagError {
   #[error("internal error ({0})")]
-  InternalError(String),
+  InternalError(&'static str),
   #[error("invalid ring")]
   InvalidRing,
   #[error("invalid ring member (member {0}, ring size {1})")]
@@ -48,6 +54,7 @@ pub enum ClsagError {
   InvalidC1,
 }
 
+/// Input being signed for.
 #[derive(Clone, PartialEq, Eq, Debug, Zeroize, ZeroizeOnDrop)]
 pub struct ClsagInput {
   // The actual commitment for the true spend
@@ -60,7 +67,7 @@ impl ClsagInput {
   pub fn new(commitment: Commitment, decoys: Decoys) -> Result<ClsagInput, ClsagError> {
     let n = decoys.len();
     if n > u8::MAX.into() {
-      Err(ClsagError::InternalError("max ring size in this library is u8 max".to_string()))?;
+      Err(ClsagError::InternalError("max ring size in this library is u8 max"))?;
     }
     let n = u8::try_from(n).unwrap();
     if decoys.i >= n {
@@ -189,6 +196,7 @@ fn core(
   ((D, c * mu_P, c * mu_C), c1.unwrap_or(c))
 }
 
+/// CLSAG signature, as used in Monero.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Clsag {
   pub D: EdwardsPoint,
@@ -225,10 +233,12 @@ impl Clsag {
     (Clsag { D, s, c1 }, pseudo_out, p, c * z)
   }
 
-  // Single signer CLSAG
+  /// Generate CLSAG signatures for the given inputs.
+  /// inputs is of the form (private key, key image, input).
+  /// sum_outputs is for the sum of the outputs' commitment masks.
   pub fn sign<R: RngCore + CryptoRng>(
     rng: &mut R,
-    mut inputs: Vec<(Scalar, EdwardsPoint, ClsagInput)>,
+    mut inputs: Vec<(Zeroizing<Scalar>, EdwardsPoint, ClsagInput)>,
     sum_outputs: Scalar,
     msg: [u8; 32],
   ) -> Vec<(Clsag, EdwardsPoint)> {
@@ -242,19 +252,25 @@ impl Clsag {
         sum_pseudo_outs += mask;
       }
 
-      let mut nonce = random_scalar(rng);
+      let mut nonce = Zeroizing::new(random_scalar(rng));
       let (mut clsag, pseudo_out, p, c) = Clsag::sign_core(
         rng,
         &inputs[i].1,
         &inputs[i].2,
         mask,
         &msg,
-        &nonce * &ED25519_BASEPOINT_TABLE,
-        nonce * hash_to_point(inputs[i].2.decoys.ring[usize::from(inputs[i].2.decoys.i)][0]),
+        nonce.deref() * &ED25519_BASEPOINT_TABLE,
+        nonce.deref() *
+          hash_to_point(inputs[i].2.decoys.ring[usize::from(inputs[i].2.decoys.i)][0]),
       );
-      clsag.s[usize::from(inputs[i].2.decoys.i)] = nonce - ((p * inputs[i].0) + c);
+      clsag.s[usize::from(inputs[i].2.decoys.i)] =
+        (-((p * inputs[i].0.deref()) + c)) + nonce.deref();
       inputs[i].0.zeroize();
       nonce.zeroize();
+
+      debug_assert!(clsag
+        .verify(&inputs[i].2.decoys.ring, &inputs[i].1, &pseudo_out, &msg)
+        .is_ok());
 
       res.push((clsag, pseudo_out));
     }
@@ -262,6 +278,7 @@ impl Clsag {
     res
   }
 
+  /// Verify the CLSAG signature against the given Transaction data.
   pub fn verify(
     &self,
     ring: &[[EdwardsPoint; 2]],
@@ -297,13 +314,13 @@ impl Clsag {
     (ring_len * 32) + 32 + 32
   }
 
-  pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+  pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
     write_raw_vec(write_scalar, &self.s, w)?;
     w.write_all(&self.c1.to_bytes())?;
     write_point(&self.D, w)
   }
 
-  pub fn deserialize<R: std::io::Read>(decoys: usize, r: &mut R) -> std::io::Result<Clsag> {
+  pub fn read<R: Read>(decoys: usize, r: &mut R) -> io::Result<Clsag> {
     Ok(Clsag { s: read_raw_vec(read_scalar, decoys, r)?, c1: read_scalar(r)?, D: read_point(r)? })
   }
 }

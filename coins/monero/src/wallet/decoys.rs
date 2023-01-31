@@ -47,7 +47,7 @@ async fn select_n<R: RngCore + CryptoRng>(
       iters += 1;
       // This is cheap and on fresh chains, thousands of rounds may be needed
       if iters == 10000 {
-        Err(RpcError::InternalError("not enough decoy candidates".to_string()))?;
+        Err(RpcError::InternalError("not enough decoy candidates"))?;
       }
 
       // Use a gamma distribution
@@ -115,6 +115,7 @@ fn offset(ring: &[u64]) -> Vec<u64> {
   res
 }
 
+/// Decoy data, containing the actual member as well (at index `i`).
 #[derive(Clone, PartialEq, Eq, Debug, Zeroize, ZeroizeOnDrop)]
 pub struct Decoys {
   pub i: u8,
@@ -127,6 +128,7 @@ impl Decoys {
     self.offsets.len()
   }
 
+  /// Select decoys using the same distribution as Monero.
   pub async fn select<R: RngCore + CryptoRng>(
     rng: &mut R,
     rpc: &Rpc,
@@ -176,7 +178,7 @@ impl Decoys {
 
     // TODO: Simply create a TX with less than the target amount
     if (high - MATURITY) < u64::try_from(inputs.len() * ring_len).unwrap() {
-      Err(RpcError::InternalError("not enough decoy candidates".to_string()))?;
+      Err(RpcError::InternalError("not enough decoy candidates"))?;
     }
 
     // Select all decoys for this transaction, assuming we generate a sane transaction

@@ -1,13 +1,17 @@
 use core::cmp::Ordering;
+use std::io::{self, Read, Write};
 
 use zeroize::Zeroize;
 
-use curve25519_dalek::edwards::{EdwardsPoint, CompressedEdwardsY};
+use curve25519_dalek::{
+  scalar::Scalar,
+  edwards::{EdwardsPoint, CompressedEdwardsY},
+};
 
 use crate::{
   Protocol, hash,
   serialize::*,
-  ringct::{RctPrunable, RctSignatures},
+  ringct::{RctBase, RctPrunable, RctSignatures},
 };
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -24,7 +28,7 @@ impl Input {
     1 + 1 + 1 + (8 * ring_len) + 32
   }
 
-  pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+  pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
     match self {
       Input::Gen(height) => {
         w.write_all(&[255])?;
@@ -40,7 +44,7 @@ impl Input {
     }
   }
 
-  pub fn deserialize<R: std::io::Read>(r: &mut R) -> std::io::Result<Input> {
+  pub fn read<R: Read>(r: &mut R) -> io::Result<Input> {
     Ok(match read_byte(r)? {
       255 => Input::Gen(read_varint(r)?),
       2 => Input::ToKey {
@@ -48,10 +52,9 @@ impl Input {
         key_offsets: read_vec(read_varint, r)?,
         key_image: read_torsion_free_point(r)?,
       },
-      _ => Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "Tried to deserialize unknown/unused input type",
-      ))?,
+      _ => {
+        Err(io::Error::new(io::ErrorKind::Other, "Tried to deserialize unknown/unused input type"))?
+      }
     })
   }
 }
@@ -69,9 +72,9 @@ impl Output {
     1 + 1 + 32 + 1
   }
 
-  pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+  pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
     write_varint(&self.amount, w)?;
-    w.write_all(&[2 + (if self.view_tag.is_some() { 1 } else { 0 })])?;
+    w.write_all(&[2 + u8::from(self.view_tag.is_some())])?;
     w.write_all(&self.key.to_bytes())?;
     if let Some(view_tag) = self.view_tag {
       w.write_all(&[view_tag])?;
@@ -79,13 +82,13 @@ impl Output {
     Ok(())
   }
 
-  pub fn deserialize<R: std::io::Read>(r: &mut R) -> std::io::Result<Output> {
+  pub fn read<R: Read>(r: &mut R) -> io::Result<Output> {
     let amount = read_varint(r)?;
     let view_tag = match read_byte(r)? {
       2 => false,
       3 => true,
-      _ => Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
+      _ => Err(io::Error::new(
+        io::ErrorKind::Other,
         "Tried to deserialize unknown/unused output type",
       ))?,
     };
@@ -116,11 +119,7 @@ impl Timelock {
     }
   }
 
-  pub(crate) fn fee_weight() -> usize {
-    8
-  }
-
-  fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+  fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
     write_varint(
       &match self {
         Timelock::None => 0,
@@ -164,21 +163,21 @@ impl TransactionPrefix {
       extra
   }
 
-  pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+  pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
     write_varint(&self.version, w)?;
-    self.timelock.serialize(w)?;
-    write_vec(Input::serialize, &self.inputs, w)?;
-    write_vec(Output::serialize, &self.outputs, w)?;
+    self.timelock.write(w)?;
+    write_vec(Input::write, &self.inputs, w)?;
+    write_vec(Output::write, &self.outputs, w)?;
     write_varint(&self.extra.len().try_into().unwrap(), w)?;
     w.write_all(&self.extra)
   }
 
-  pub fn deserialize<R: std::io::Read>(r: &mut R) -> std::io::Result<TransactionPrefix> {
+  pub fn read<R: Read>(r: &mut R) -> io::Result<TransactionPrefix> {
     let mut prefix = TransactionPrefix {
       version: read_varint(r)?,
       timelock: Timelock::from_raw(read_varint(r)?),
-      inputs: read_vec(Input::deserialize, r)?,
-      outputs: read_vec(Output::deserialize, r)?,
+      inputs: read_vec(Input::read, r)?,
+      outputs: read_vec(Output::read, r)?,
       extra: vec![],
     };
     prefix.extra = read_vec(read_byte, r)?;
@@ -186,9 +185,11 @@ impl TransactionPrefix {
   }
 }
 
+/// Monero transaction. For version 1, rct_signatures still contains an accurate fee value.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Transaction {
   pub prefix: TransactionPrefix,
+  pub signatures: Vec<(Scalar, Scalar)>,
   pub rct_signatures: RctSignatures,
 }
 
@@ -203,15 +204,44 @@ impl Transaction {
       RctSignatures::fee_weight(protocol, inputs, outputs)
   }
 
-  pub fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
-    self.prefix.serialize(w)?;
-    self.rct_signatures.serialize(w)
+  pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    self.prefix.write(w)?;
+    if self.prefix.version == 1 {
+      for sig in &self.signatures {
+        write_scalar(&sig.0, w)?;
+        write_scalar(&sig.1, w)?;
+      }
+      Ok(())
+    } else if self.prefix.version == 2 {
+      self.rct_signatures.write(w)
+    } else {
+      panic!("Serializing a transaction with an unknown version");
+    }
   }
 
-  pub fn deserialize<R: std::io::Read>(r: &mut R) -> std::io::Result<Transaction> {
-    let prefix = TransactionPrefix::deserialize(r)?;
-    Ok(Transaction {
-      rct_signatures: RctSignatures::deserialize(
+  pub fn read<R: Read>(r: &mut R) -> io::Result<Transaction> {
+    let prefix = TransactionPrefix::read(r)?;
+    let mut signatures = vec![];
+    let mut rct_signatures = RctSignatures {
+      base: RctBase { fee: 0, ecdh_info: vec![], commitments: vec![] },
+      prunable: RctPrunable::Null,
+    };
+
+    if prefix.version == 1 {
+      for _ in 0 .. prefix.inputs.len() {
+        signatures.push((read_scalar(r)?, read_scalar(r)?));
+      }
+      rct_signatures.base.fee = prefix
+        .inputs
+        .iter()
+        .map(|input| match input {
+          Input::Gen(..) => 0,
+          Input::ToKey { amount, .. } => *amount,
+        })
+        .sum::<u64>()
+        .saturating_sub(prefix.outputs.iter().map(|output| output.amount).sum());
+    } else if prefix.version == 2 {
+      rct_signatures = RctSignatures::read(
         prefix
           .inputs
           .iter()
@@ -222,62 +252,58 @@ impl Transaction {
           .collect(),
         prefix.outputs.len(),
         r,
-      )?,
-      prefix,
-    })
+      )?;
+    } else {
+      Err(io::Error::new(io::ErrorKind::Other, "Tried to deserialize unknown version"))?;
+    }
+
+    Ok(Transaction { prefix, signatures, rct_signatures })
   }
 
   pub fn hash(&self) -> [u8; 32] {
-    let mut serialized = Vec::with_capacity(2048);
+    let mut buf = Vec::with_capacity(2048);
     if self.prefix.version == 1 {
-      self.serialize(&mut serialized).unwrap();
-      hash(&serialized)
+      self.write(&mut buf).unwrap();
+      hash(&buf)
     } else {
-      let mut sig_hash = Vec::with_capacity(96);
+      let mut hashes = Vec::with_capacity(96);
 
-      self.prefix.serialize(&mut serialized).unwrap();
-      sig_hash.extend(hash(&serialized));
-      serialized.clear();
+      self.prefix.write(&mut buf).unwrap();
+      hashes.extend(hash(&buf));
+      buf.clear();
 
-      self
-        .rct_signatures
-        .base
-        .serialize(&mut serialized, self.rct_signatures.prunable.rct_type())
-        .unwrap();
-      sig_hash.extend(hash(&serialized));
-      serialized.clear();
+      self.rct_signatures.base.write(&mut buf, self.rct_signatures.prunable.rct_type()).unwrap();
+      hashes.extend(hash(&buf));
+      buf.clear();
 
       match self.rct_signatures.prunable {
-        RctPrunable::Null => serialized.resize(32, 0),
+        RctPrunable::Null => buf.resize(32, 0),
         _ => {
-          self.rct_signatures.prunable.serialize(&mut serialized).unwrap();
-          serialized = hash(&serialized).to_vec();
+          self.rct_signatures.prunable.write(&mut buf).unwrap();
+          buf = hash(&buf).to_vec();
         }
       }
-      sig_hash.extend(&serialized);
+      hashes.extend(&buf);
 
-      hash(&sig_hash)
+      hash(&hashes)
     }
   }
 
+  /// Calculate the hash of this transaction as needed for signing it.
   pub fn signature_hash(&self) -> [u8; 32] {
-    let mut serialized = Vec::with_capacity(2048);
+    let mut buf = Vec::with_capacity(2048);
     let mut sig_hash = Vec::with_capacity(96);
 
-    self.prefix.serialize(&mut serialized).unwrap();
-    sig_hash.extend(hash(&serialized));
-    serialized.clear();
+    self.prefix.write(&mut buf).unwrap();
+    sig_hash.extend(hash(&buf));
+    buf.clear();
 
-    self
-      .rct_signatures
-      .base
-      .serialize(&mut serialized, self.rct_signatures.prunable.rct_type())
-      .unwrap();
-    sig_hash.extend(hash(&serialized));
-    serialized.clear();
+    self.rct_signatures.base.write(&mut buf, self.rct_signatures.prunable.rct_type()).unwrap();
+    sig_hash.extend(hash(&buf));
+    buf.clear();
 
-    self.rct_signatures.prunable.signature_serialize(&mut serialized).unwrap();
-    sig_hash.extend(&hash(&serialized));
+    self.rct_signatures.prunable.signature_write(&mut buf).unwrap();
+    sig_hash.extend(hash(&buf));
 
     hash(&sig_hash)
   }

@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+
 use zeroize::Zeroize;
 
 use ff::PrimeFieldBits;
@@ -31,8 +33,7 @@ where
 
     #[allow(unused_assignments)]
     for (i, mut raw_bit) in bits.iter_mut().enumerate() {
-      let mut bit = *raw_bit as u8;
-      debug_assert_eq!(bit | 1, 1);
+      let mut bit = u8::from(*raw_bit);
       *raw_bit = false;
 
       groupings[p][i / w_usize] |= bit << (i % w_usize);
@@ -159,7 +160,8 @@ fn algorithm(len: usize) -> Algorithm {
   }
 }
 
-// Performs a multiexp, automatically selecting the optimal algorithm based on amount of pairs
+/// Performs a multiexponentation, automatically selecting the optimal algorithm based on the
+/// amount of pairs.
 pub fn multiexp<G: Group>(pairs: &[(G::Scalar, G)]) -> G
 where
   G::Scalar: PrimeFieldBits + Zeroize,
@@ -172,6 +174,8 @@ where
   }
 }
 
+/// Performs a multiexponentation in variable time, automatically selecting the optimal algorithm
+/// based on the amount of pairs.
 pub fn multiexp_vartime<G: Group>(pairs: &[(G::Scalar, G)]) -> G
 where
   G::Scalar: PrimeFieldBits,
