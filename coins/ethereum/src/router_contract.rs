@@ -10,21 +10,21 @@ use std::{convert::From, fs::File, sync::Arc};
 //   event_derives(serde::Deserialize, serde::Serialize),
 // );
 
-impl From<&PublicKey> for router::PublicKey {
+impl From<&PublicKey> for RpublicKey {
   fn from(public_key: &PublicKey) -> Self {
-    router::PublicKey { parity: public_key.parity, px: public_key.px.to_bytes().into() }
+    RpublicKey { parity: public_key.parity, px: public_key.px.to_bytes().into() }
   }
 }
 
-impl From<&ProcessedSignature> for router::Signature {
+impl From<&ProcessedSignature> for Rsignature {
   fn from(signature: &ProcessedSignature) -> Self {
-    router::Signature { s: signature.s.to_bytes().into(), e: signature.e.to_bytes().into() }
+    Rsignature { s: signature.s.to_bytes().into(), e: signature.e.to_bytes().into() }
   }
 }
 
-pub async fn deploy_router_contract(
-  client: Arc<SignerMiddleware<Provider<Http>, LocalWallet>>,
-) -> Result<router::Router<SignerMiddleware<Provider<Http>, LocalWallet>>> {
+pub async fn deploy_router_contract<M: Middleware + 'static>(
+  client: Arc<M /*SignerMiddleware<Provider<Http>, LocalWallet>*/>,
+) -> Result<Router<M>> {
   let path = "./artifacts/Router.sol/Router.json";
   let artifact: ContractBytecode = serde_json::from_reader(File::open(path).unwrap()).unwrap();
   let abi = artifact.abi.unwrap();
@@ -35,8 +35,8 @@ pub async fn deploy_router_contract(
   Ok(contract)
 }
 
-pub async fn router_set_public_key(
-  contract: &router::Router<SignerMiddleware<Provider<Http>, LocalWallet>>,
+pub async fn router_set_public_key<M: Middleware + 'static>(
+  contract: &Router<M>,
   public_key: &PublicKey,
 ) -> std::result::Result<Option<TransactionReceipt>, eyre::ErrReport> {
   let tx = contract.set_public_key(public_key.into());
@@ -45,8 +45,8 @@ pub async fn router_set_public_key(
   Ok(receipt)
 }
 
-pub async fn router_update_public_key(
-  contract: &router::Router<SignerMiddleware<Provider<Http>, LocalWallet>>,
+pub async fn router_update_public_key<M: Middleware + 'static>(
+  contract: &Router<M>,
   public_key: &PublicKey,
   signature: &ProcessedSignature,
 ) -> std::result::Result<Option<TransactionReceipt>, eyre::ErrReport> {
@@ -56,9 +56,9 @@ pub async fn router_update_public_key(
   Ok(receipt)
 }
 
-pub async fn router_execute(
-  contract: &router::Router<SignerMiddleware<Provider<Http>, LocalWallet>>,
-  txs: Vec<router::Transaction>,
+pub async fn router_execute<M: Middleware + 'static>(
+  contract: &Router<M>,
+  txs: Vec<Rtransaction>,
   signature: &ProcessedSignature,
 ) -> std::result::Result<Option<TransactionReceipt>, eyre::ErrReport> {
   let tx = contract.execute(txs, signature.into());

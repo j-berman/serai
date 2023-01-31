@@ -1,6 +1,6 @@
 use rand_core::OsRng;
 
-use k256::{elliptic_curve::bigint::ArrayEncoding, ProjectivePoint, U256};
+use k256::{elliptic_curve::bigint::ArrayEncoding, U256};
 
 use ethers::{
   prelude::*,
@@ -10,11 +10,10 @@ use ethers::{
 use frost::{
   curve::Secp256k1,
   algorithm::Schnorr as Algo,
-  ThresholdKeys,
   tests::{algorithm_machines, key_gen, sign},
 };
 
-use std::{convert::TryFrom, collections::HashMap, sync::Arc, time::Duration};
+use std::{convert::TryFrom, sync::Arc, time::Duration};
 
 use ethereum_serai::{
   crypto,
@@ -22,7 +21,6 @@ use ethereum_serai::{
 };
 
 mod utils;
-use crate::utils::{generate_keys};
 
 async fn deploy_test_contract(
 ) -> (u32, AnvilInstance, Schnorr<SignerMiddleware<Provider<Http>, LocalWallet>>) {
@@ -44,9 +42,6 @@ async fn test_deploy_contract() {
 
 #[tokio::test]
 async fn test_ecrecover_hack() {
-  let (keys, group_key): (HashMap<u16, ThresholdKeys<Secp256k1>>, ProjectivePoint) =
-    generate_keys().await;
-
   let (chain_id, _anvil, contract) = deploy_test_contract().await;
   let chain_id = U256::from(chain_id);
 

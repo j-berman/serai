@@ -1,6 +1,6 @@
 use ethereum_serai::{
   crypto::PublicKey,
-  router::router::Transaction,
+  router::router::Rtransaction,
   router_contract::{router_execute, router_set_public_key, deploy_router_contract},
 };
 use frost::{curve::Secp256k1, ThresholdKeys};
@@ -47,17 +47,17 @@ async fn test_router_execute() {
   let gas = U256::from(7000000); // arbitrary
   let data = Bytes::from([0]);
   let tx =
-    Transaction { to: to.clone(), value: value.clone(), gas: gas.clone(), data: data.clone() };
+    Rtransaction { to: to.clone(), value: value.clone(), gas: gas.clone(), data: data.clone() };
   let txs = vec![tx];
 
   // try with wrong message
   const MESSAGE: &'static [u8] = b"Hello, World!";
   let processed_sig = hash_and_sign(MESSAGE, keys.clone(), &group_key, chain_id).await;
   let res = router_execute(&contract, txs.clone(), &processed_sig).await;
-  // assert!(res.is_err()); // should revert as signature is for incorrect message
+  assert!(res.is_err()); // should revert as signature is for incorrect message
 
   // try w actual data
-  let nonce_call = contract.get_nonce();
+  let nonce_call = contract.nonce();
   let nonce = nonce_call.call().await.unwrap();
   let tokens = vec![
     abi::Token::Uint(nonce),
@@ -71,7 +71,11 @@ async fn test_router_execute() {
   let encoded_calldata = abi::encode(&tokens);
   let processed_sig = hash_and_sign(&encoded_calldata, keys, &group_key, chain_id).await;
   let receipt = router_execute(&contract, txs.clone(), &processed_sig).await.unwrap().unwrap();
+
+  // TODO: is this an issue with foundry/anvil?
+  // returning true always from execute() still doesn't fix this.
   //assert_eq!(receipt.status.unwrap(), U64::from(1));
+
   println!("gas used: {:?}", receipt.cumulative_gas_used);
   println!("logs: {:?}", receipt.logs);
 }

@@ -35,3 +35,4 @@ ethers = { version = "1", features = ["abigen", "ethers-solc"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] }
+
