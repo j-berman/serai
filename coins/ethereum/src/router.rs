@@ -1,4 +1,5 @@
 pub use router::*;
+#[rustfmt::skip]
 #[allow(clippy::too_many_arguments, non_camel_case_types)]
 pub mod router {
   #![allow(clippy::enum_variant_names)]

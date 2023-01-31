@@ -10,8 +10,8 @@ use ethers::{
 use frost::{
   curve::Secp256k1,
   algorithm::Schnorr as Algo,
-  FrostKeys,
-  tests::{algorithm_machines, sign},
+  ThresholdKeys,
+  tests::{algorithm_machines, key_gen, sign},
 };
 
 use std::{convert::TryFrom, collections::HashMap, sync::Arc, time::Duration};
@@ -44,7 +44,7 @@ async fn test_deploy_contract() {
 
 #[tokio::test]
 async fn test_ecrecover_hack() {
-  let (keys, group_key): (HashMap<u16, FrostKeys<Secp256k1>>, ProjectivePoint) =
+  let (keys, group_key): (HashMap<u16, ThresholdKeys<Secp256k1>>, ProjectivePoint) =
     generate_keys().await;
 
   let (chain_id, _anvil, contract) = deploy_test_contract().await;
